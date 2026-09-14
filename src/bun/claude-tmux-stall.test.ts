@@ -37,13 +37,9 @@ function seedTask(): string {
     workdir: "/tmp", isolation: "none", taskType: "task",
     branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
     mode: "auto", model: null, effort: null,
-    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    fast: false, maxMode: false, references: [], backlog: [], plans: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
-    pipelineStage: null, planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pipelineBounceFingerprint: null,
-    pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null,
-    childMergeStatus: null,
   });
   return id;
 }
