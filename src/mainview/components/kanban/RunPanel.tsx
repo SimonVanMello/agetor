@@ -243,6 +243,15 @@ export const EXIT_DURATION_MS = 250;
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
 
+// Upper bound on how long the git-status and PR-mergeability fetches (each
+// declared further down `RunPanelBody`) wait behind the SSE subscription's
+// first `replay_meta` frame before firing anyway — see `markStreamReady`/
+// `awaitStreamReady` near `runsLoaded`. A dead task (no SSE endpoint
+// reachable at all) or an unusually slow replay must not starve those
+// fetches forever; 400ms is comfortably above a normal replay's latency
+// while still well inside "the switch burst" the deferral exists to avoid.
+const STREAM_READY_FALLBACK_MS = 400;
+
 // Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
 const IS_MAC_PLATFORM = isMacPlatform();
 
@@ -576,6 +585,19 @@ function RunPanelBody({
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
+  /** The task id this render's async handlers should be writing state for.
+   *  RunPanelBody is NOT remounted on task switch (see `RunPanel`'s call
+   *  site in App.tsx), so an async handler (`send`, `saveForLater`,
+   *  `rebuildFromJsonl`, the backlog CRUD helpers, …) that captured task A's
+   *  id before an `await` must not write its post-await result into state
+   *  once the panel has moved on to task B. Written synchronously at the top
+   *  of the `[task.id]` reset effect below — a ref, not state, so the write
+   *  is visible to an already-in-flight async closure the instant the reset
+   *  effect runs, with no render latency. Handlers capture `task.id` into a
+   *  local (e.g. `sentTaskId`) before their first `await`, then compare it
+   *  against `currentTaskIdRef.current` after every `await` before writing
+   *  shared per-task state. */
+  const currentTaskIdRef = useRef(task.id);
   // Agent-profile header chip: `resolveTaskProfileDisplay` gives the
   // deleted flag + summary (live profile until the task's first run — plan
   // D2 — else the frozen snapshot); `agentProfileForCard` resolves the
@@ -712,12 +734,69 @@ function RunPanelBody({
    *  earlier" button together with `earliestId !== null`. */
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** True once the FIRST `listRuns` response for the CURRENT task has
+   *  landed (see the runs-poll effect below, which sets this — guarded by
+   *  that effect's own `cancelled` flag, so a late response for a task the
+   *  user has already switched away from can never flip it). Drives the
+   *  transcript's loading skeleton: `runs.length === 0` and
+   *  `displayedEvents.length === 0` both read as "nothing here" whether the
+   *  task genuinely has no runs yet or its runs just haven't loaded — this
+   *  flag is what tells those two states apart so a freshly opened task
+   *  shows "Loading messages…" instead of a premature "no runs yet". */
+  const [runsLoaded, setRunsLoaded] = useState(false);
+  // ── Stream-first gating for non-essential fetches ─────────────────────────
+  // Git status and PR-mergeability (below, each declared later in this
+  // component) must not fire in the same burst as a task switch — they'd
+  // otherwise compete with the SSE subscription for the webview's shared
+  // per-host connection budget. Both wait on this gate instead: ready the
+  // instant the SSE subscription effect's `replay_meta` frame arrives for
+  // THIS task, or after STREAM_READY_FALLBACK_MS, whichever comes first
+  // (both signals are owned by the SSE subscription effect below). Refs,
+  // not state: `markStreamReady`/`awaitStreamReady` are called from inside
+  // async closures set up by effects declared later in the component, and a
+  // ref mutation is visible to those closures the instant it happens — no
+  // render latency — which matters because the reset effect right below and
+  // the SSE effect that marks readiness both fire within the same
+  // task-switch commit; a state-based gate could still be read stale by an
+  // effect that re-runs in that same commit before the state update lands.
+  //
+  // The gate is keyed by TASK ID, not a bare boolean: `streamReadyForRef`
+  // holds the id of the task whose stream is ready (or null), and every
+  // waiter records which task it is waiting for. This matters for children
+  // keyed on `task.id` (`TerminalsSection`): React runs a child's mount
+  // effect BEFORE the parent's effects in the same commit, so on a switch
+  // the new task's section mounts and asks the gate before the reset effect
+  // below has cleared it — a bare boolean would still read the PREVIOUS
+  // task's `true` and let the terminal list fetch into the switch burst.
+  const streamReadyForRef = useRef<string | null>(null);
+  const streamReadyWaitersRef = useRef<Array<{ taskId: string; resolve: () => void }>>([]);
+  const markStreamReady = () => {
+    const forTaskId = currentTaskIdRef.current;
+    if (streamReadyForRef.current === forTaskId) return;
+    streamReadyForRef.current = forTaskId;
+    const waiters = streamReadyWaitersRef.current;
+    streamReadyWaitersRef.current = waiters.filter((w) => w.taskId !== forTaskId);
+    for (const w of waiters) if (w.taskId === forTaskId) w.resolve();
+  };
+  /** Resolves once the stream is ready for `forTaskId` (default: the task
+   *  currently mounted in this body). Callers keyed per task (children that
+   *  remount on switch) MUST pass their own `task.id` — see the note above. */
+  const awaitStreamReady = (forTaskId: string = currentTaskIdRef.current): Promise<void> => {
+    if (streamReadyForRef.current === forTaskId) return Promise.resolve();
+    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push({ taskId: forTaskId, resolve }); });
+  };
 
-  // Reset on task switch (no remount because we no longer key on task.id).
-  // Re-arm the auto-scroll heuristic so opening a different task pins the
-  // viewport to the most recent message instead of inheriting the previous
-  // task's scrolled-up position.
+  // Reset on task switch (no remount because we no longer key on task.id —
+  // see `RunPanelBody`'s call site in `App.tsx`). Re-arm the auto-scroll
+  // heuristic so opening a different task pins the viewport to the most
+  // recent message instead of inheriting the previous task's scrolled-up
+  // position. This effect resets every piece of state in `RunPanelBody`
+  // that isn't itself keyed by task id or re-seeded from `task` via its own
+  // `useEffect` (`backlogItems`/`plans` above do that already) — the goal is
+  // that nothing task A produced (an in-flight send, a busy flag, cached
+  // git/PR status) is visible while task B's panel is still catching up.
   useEffect(() => {
+    currentTaskIdRef.current = task.id;
     setEvents([]);
     eventsRef.current = [];
     prevEventIdRef.current = -1;
@@ -734,6 +813,19 @@ function RunPanelBody({
     setSearchQuery("");
     setActiveMatchId(null);
     nearBottomRef.current = true;
+    setRuns([]);
+    setRunsLoaded(false);
+    // Resolve any waiters a still-tearing-down previous task's git-status/
+    // PR-mergeability effects left pending — each one's own `cancelled` flag
+    // (captured in its effect's cleanup) makes the resume a no-op, so this
+    // just prevents the promise from dangling forever unresolved.
+    // Only waiters for OTHER tasks are stale here: a waiter the incoming
+    // task's own keyed child already registered (its mount effect ran before
+    // this parent effect) must stay queued until this task's stream is ready.
+    const staleWaiters = streamReadyWaitersRef.current.filter((w) => w.taskId !== task.id);
+    streamReadyWaitersRef.current = streamReadyWaitersRef.current.filter((w) => w.taskId === task.id);
+    for (const w of staleWaiters) w.resolve();
+    streamReadyForRef.current = null;
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -745,7 +837,28 @@ function RunPanelBody({
     // executed at least once.
     setPrStatus(null);
     setPrStatusError(null);
+    setPrStatusLoading(false);
+    // Invalidate any in-flight `fetchPrStatus` (including a pending self-heal
+    // retry) task A's effects left running — without this, a slow response
+    // that lands after the switch would pass its own `requestId !==
+    // prStatusSeqRef.current` staleness check (it captured the pre-bump
+    // value) and write task A's mergeability into task B's `prStatus`.
+    prStatusSeqRef.current++;
     setResolveConflictsSent(false);
+    setResolvingConflicts(false);
+    setSending(false);
+    setSendHint(null);
+    setBacklogBusy(false);
+    setRebuildBusy(false);
+    // fx-only busy flags (Resume / Cancel auto-resume buttons) — same per-task
+    // scope as `sending`: a click on task A must not leave B's button disabled.
+    setResumeBusy(false);
+    setCancelAutoBusy(false);
+    setGitStatus(null);
+    // `editingId` (the backlog tray's inline-editor state) lives inside the
+    // `BacklogTray` child component, not here — it's reset by keying that
+    // component on `task.id` at its call site below instead (a fresh mount
+    // per task), which is simpler than plumbing a reset callback down.
     if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
     prStatusRetryTimerRef.current = null;
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -758,10 +871,13 @@ function RunPanelBody({
 
   const rebuildFromJsonl = async () => {
     if (!latestRun || !latestRun.claudeSessionId || rebuildBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setRebuildBusy(true);
     setRebuildNote(null);
     try {
       const res = await api.rebuildRunEvents(latestRun.id);
+      if (currentTaskIdRef.current !== sentTaskId) return;
       if (res.events.length === 0) {
         setRebuildNote(res.reason ?? "no events found in JSONL");
         return;
@@ -772,191 +888,48 @@ function RunPanelBody({
         // "Everything observed so far" — see `nextEventIdRef`.
         maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
       });
-      setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+      // The route byte-budgets the snapshot (newest events first); when it
+      // had to cut older ones it says so, and "Load earlier" pages the rest
+      // — same handling as the auto-rebuild effect below.
+      if (res.hasMore) setHasMoreEarlier(true);
+      setRebuildNote(
+        res.hasMore
+          ? `Loaded the most recent ${res.events.length} events from session JSONL — older history is available via "Load earlier messages".`
+          : `Loaded ${res.events.length} events from session JSONL.`,
+      );
     } catch (e) {
+      if (currentTaskIdRef.current !== sentTaskId) return;
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
     } finally {
-      setRebuildBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setRebuildBusy(false);
     }
   };
-
-  // Bootstrap any interactions that fired before the panel opened (race
-  // between claude tool calls and the panel mount). The SSE subscription
-  // picks up new ones from here on.
-  useEffect(() => {
-    let cancelled = false;
-    void api.listPendingInteractions(task.id).then((list) => {
-      if (cancelled) return;
-      setInteractions(list);
-    }).catch(() => { /* ignore — empty start is fine */ });
-    return () => { cancelled = true; };
-  }, [task.id]);
-
-  // Stable identity so RunEventList's memoized block tree isn't invalidated
-  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
-  // stable setter, so the empty dep list is correct.
-  const dismissInteraction = useCallback(
-    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
-    [],
-  );
-
-  // ── Poll gating (runs + subagents) ────────────────────────────────────────
-  // Both 2s polls below share the same "is there any reason to keep looking"
-  // condition: a run in flight, a subagent running, or an interaction waiting
-  // on the user. These booleans are read by each poll's own `evaluate()`
-  // (defined inside the effect so it can start/stop that effect's own timer)
-  // — refs, not plain closures, because `latestRun`/`subagentList`/
-  // `interactions` change on every render without re-running the poll effects
-  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
-  // so an interaction resolving doesn't reset an in-flight interval). The
-  // kick/evaluate refs let the activity-change effect and the SSE handler
-  // below reach into a poll effect that was set up earlier without needing it
-  // in their own dependency arrays.
-  const runActiveRef = useRef(false);
-  const subagentActiveRef = useRef(false);
-  const interactionPendingRef = useRef(false);
-  const runsPollKickRef = useRef<() => void>(() => {});
-  const subagentsPollKickRef = useRef<() => void>(() => {});
-  const runsPollEvaluateRef = useRef<() => void>(() => {});
-  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    runActiveRef.current = latestRun?.status === "running";
-    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
-    interactionPendingRef.current = interactions.length > 0;
-    // Re-arm (or re-suspend) both polls now that the activity picture changed
-    // — e.g. the latest run just resolved (stop) or a subagent just finished
-    // while the run was already idle (also stop; the reverse case, a run/
-    // subagent starting, is normally already covered by `task.runId`/mount
-    // effects below, but this keeps both polls honest either way).
-    runsPollEvaluateRef.current();
-    subagentsPollEvaluateRef.current();
-  }, [latestRun?.status, subagentList, interactions.length]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listRuns(task.id);
-        if (cancelled) return;
-        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // Mirrors whether the timer is currently (supposed to be) running.
-    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
-    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
-    // early return below skips the `document.hidden`/ref reads and the
-    // start/stop call entirely once the desired state already matches,
-    // rather than re-deriving and re-applying the same state on every event.
-    let armed = false;
-    // Paused while the window is hidden (nothing to repaint) or once the task
-    // has gone fully idle (terminal run, no subagent running, no pending
-    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
-    // SSE event, so a change on the server side is never missed for long.
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    runsPollKickRef.current = kick;
-    runsPollEvaluateRef.current = evaluate;
-    void load(); // initial load on mount always happens, regardless of gating
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id, task.runId]);
-
-  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
-  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
-  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
-  // runs poll above (own timer, shared activity refs).
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listSubagents(task.id);
-        if (cancelled) return;
-        setSubagentList((cur) => {
-          // Union by id: the poll (DB) is authoritative on status, but keep any
-          // id we only know from a just-arrived SSE delta that the poll query
-          // raced. Sort by spawn order so tabs don't reshuffle.
-          const byId = new Map<string, Subagent>();
-          for (const s of cur) byId.set(s.id, s);
-          for (const s of list) byId.set(s.id, s);
-          // Identity-preserving: hand back `cur` itself when nothing changed,
-          // so this backstop poll can't re-render the whole open panel every
-          // 2s while a run merely streams (see `reconcileById`).
-          return reconcileById(
-            cur,
-            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
-            (s) => s.id,
-          );
-        });
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // See the runs-poll effect above for why this early-returns on a no-op
-    // state transition instead of re-deriving/re-applying on every call.
-    let armed = false;
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    subagentsPollKickRef.current = kick;
-    subagentsPollEvaluateRef.current = evaluate;
-    void load();
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id]);
 
   // One unified task-level stream: every event from every run, merged in
   // chronological order. Replaces the old per-run subscription so the
   // panel shows the whole conversation as a single scrollback.
+  //
+  // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
+  // and every other one-shot fetch in this component — deliberately.
+  // Passive effects commit in declaration order, so on a task switch this
+  // effect's `api.subscribeTask` call (which opens the EventSource) fires
+  // before any of those `fetch()` calls are issued. The webview has a
+  // small, shared per-host connection budget (WKWebView observed at 6 at
+  // rest), and a switch used to fire ~8 one-shot requests ahead of the new
+  // task's own event stream — starving it behind whatever else was still
+  // in flight (e.g. another task's slow session restore). This effect also
+  // owns the `markStreamReady`/`awaitStreamReady` gate (declared above,
+  // near `runsLoaded`) that the git-status and PR-mergeability effects
+  // further below wait on before firing their own requests — see the
+  // `readyTimer` and the `meta` callback's `markStreamReady()` call below.
   useEffect(() => {
     setEvents([]);
     nextEventIdRef.current = 0;
+    // Fallback half of the stream-ready gate (see the comment above): if
+    // `replay_meta` (below) hasn't arrived within STREAM_READY_FALLBACK_MS,
+    // let the deferred fetches go anyway rather than waiting on a stream
+    // that may never connect (task deleted mid-switch, backend down).
+    const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
     // Collapse the dual-emit + replay duplicates the server stream carries
     // (live echo + JSONL twin per user message; full-history replay on every
     // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
@@ -1171,6 +1144,12 @@ function RunPanelBody({
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
       },
       (meta) => {
+        // First (successful) half of the stream-ready gate: this frame is
+        // always the very first thing the server sends on (re)connect (see
+        // below), so it's the earliest reliable signal that this task's
+        // stream is actually live — clear the deferral for git-status/
+        // PR-mergeability now instead of waiting out the fallback timer.
+        markStreamReady();
         // The server sends `replay_meta` as the FIRST frame of every (re)connect
         // — including an EventSource-internal reconnect after a network blip,
         // which reuses this same subscription/effect instance rather than
@@ -1195,11 +1174,223 @@ function RunPanelBody({
       },
     );
     return () => {
+      clearTimeout(readyTimer);
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
+    };
+  }, [task.id]);
+
+  // Bootstrap any interactions that fired before the panel opened (race
+  // between claude tool calls and the panel mount). The SSE subscription
+  // picks up new ones from here on.
+  useEffect(() => {
+    let cancelled = false;
+    void api.listPendingInteractions(task.id).then((list) => {
+      if (cancelled) return;
+      setInteractions(list);
+    }).catch(() => { /* ignore — empty start is fine */ });
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
+  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
+  // stable setter, so the empty dep list is correct.
+  const dismissInteraction = useCallback(
+    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    [],
+  );
+
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // Skips a tick while the previous `load()` for this same task is still
+    // in flight — a slow response (e.g. the server itself busy with another
+    // task's session restore) must not let ticks pile up into a burst of
+    // overlapping requests once it finally resolves. Reset on cleanup only
+    // implicitly (the effect instance, and this closure's `inFlight`, don't
+    // survive past task switch anyway).
+    let inFlight = false;
+    // A `kick()` (SSE live sign / focus / visibility) that arrives while a
+    // load is already in flight would otherwise be silently dropped — record
+    // it here and replay it once, right after the in-flight load settles, so
+    // the signal that prompted the kick isn't lost.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listRuns(task.id);
+        if (cancelled) return;
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        // First response for this task — flips the transcript's loading
+        // skeleton off. Safe to call on every subsequent tick too: React
+        // bails out a same-value `setState(true)` without a re-render.
+        setRunsLoaded(true);
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [task.id, task.runId]);
+
+  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
+  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
+  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // See the runs-poll effect above for why a tick is skipped while the
+    // previous `load()` is still in flight.
+    let inFlight = false;
+    // See the runs-poll effect above for why a kick that arrives mid-flight
+    // is recorded and replayed once, rather than silently dropped.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listSubagents(task.id);
+        if (cancelled) return;
+        setSubagentList((cur) => {
+          // Union by id: the poll (DB) is authoritative on status, but keep any
+          // id we only know from a just-arrived SSE delta that the poll query
+          // raced. Sort by spawn order so tabs don't reshuffle.
+          const byId = new Map<string, Subagent>();
+          for (const s of cur) byId.set(s.id, s);
+          for (const s of list) byId.set(s.id, s);
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
+        });
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
+    void load();
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
     };
   }, [task.id]);
 
@@ -1221,9 +1412,15 @@ function RunPanelBody({
   const loadEarlierEvents = useCallback(() => {
     if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
     const el = logRef.current;
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow page fetch
+    // resolving after the user has moved to a different task must not
+    // prepend task A's history into task B's transcript state.
+    const sentTaskId = task.id;
     setLoadingEarlier(true);
-    void api.fetchTaskEventsPage(task.id, earliestId)
+    void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1255,7 +1452,9 @@ function RunPanelBody({
         setHasMoreEarlier(page.hasMore);
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
-      .finally(() => setLoadingEarlier(false));
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+      });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 
   // Restores scroll position after "Load earlier" prepends older events above
@@ -2131,11 +2330,20 @@ function RunPanelBody({
   // actually moved on from what it was at click time; a request failure has
   // nothing new to wait for, so it clears busy immediately instead.
   const handleResumeFxRecovery = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `resumeFxRecovery`
+    // resolving/rejecting after the user has moved to a different task must
+    // not touch task B's `resumeBusy`/`sendHint`/click-tracking state.
+    const sentTaskId = task.id;
     resumeClickedRunIdRef.current = latestRun?.id ?? null;
     setResumeBusy(true);
-    api.resumeFxRecovery(task.id)
-      .then(() => { runsPollKickRef.current(); })
+    api.resumeFxRecovery(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
       .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         setSendHint(e instanceof Error ? e.message : String(e));
         resumeClickedRunIdRef.current = null;
         setResumeBusy(false);
@@ -2169,13 +2377,21 @@ function RunPanelBody({
   // it, rather than lagging behind the click.
   const [cancelAutoBusy, setCancelAutoBusy] = useState(false);
   const handleCancelFxAutoResume = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setCancelAutoBusy(true);
-    api.cancelFxAutoResume(task.id)
-      .then(() => { runsPollKickRef.current(); })
+    api.cancelFxAutoResume(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
       .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         setSendHint(e instanceof Error ? e.message : String(e));
       })
-      .finally(() => setCancelAutoBusy(false));
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setCancelAutoBusy(false);
+      });
   }, [task.id]);
   /** Live fx recovery notice for the bottom-pinned heartbeat slot — fx's own
    *  retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … · retrying
@@ -2379,9 +2595,19 @@ function RunPanelBody({
   // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
   // the task object each tick, so depending on `latestRun`/`task` fields
   // here would restart this effect (and its poll cadence) every 2s.
+  //
+  // The first fetch waits on `awaitStreamReady()` (declared near
+  // `runsLoaded`, above) — a non-essential request like this one must not
+  // compete with the new task's SSE connection in the switch burst; see the
+  // subscription effect's leading comment. Deferring the loop's START this
+  // way (rather than adding `streamReady` to the dependency array) keeps the
+  // 5s cadence itself untouched once the loop is running, and keeps this
+  // effect's deps exactly as they were.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      await awaitStreamReady();
+      if (cancelled) return;
       while (!cancelled) {
         try {
           const res = await api.getTaskGitStatus(task.id);
@@ -2470,6 +2696,14 @@ function RunPanelBody({
   // rebuilds the task object every tick, and depending on the whole object
   // (or on `task.workdir`, read via closure below) would refetch on every
   // poll tick instead of only on an actual task/PR change.
+  //
+  // The "no PR" branch clears state immediately (there's no request to
+  // defer); the actual `fetchPrStatus` call waits on `awaitStreamReady()`
+  // (same non-essential-fetch deferral as the git-status effect above) so it
+  // doesn't compete with the new task's SSE connection in the switch burst.
+  // `cancelled` guards against a task switch (or a `task.prUrl` change)
+  // landing between the await and the fetch — `fetchPrStatus` itself would
+  // otherwise fire for a task this effect instance no longer represents.
   useEffect(() => {
     const parsed = parsePrUrl(task.prUrl);
     if (!parsed) {
@@ -2480,8 +2714,13 @@ function RunPanelBody({
       setPrStatusError(null);
       return;
     }
+    let cancelled = false;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsed.number);
+    void awaitStreamReady().then(() => {
+      if (cancelled) return;
+      fetchPrStatus(task.workdir, parsed.number);
+    });
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id, task.prUrl]);
 
@@ -2525,14 +2764,22 @@ function RunPanelBody({
     // same text) is mid-flight — otherwise a fast Enter could both send and
     // save the same message.
     if (sending || backlogBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `sendRunInput` (or
+    // its follow-up `listRuns`/`getTask` refresh) resolving after the user
+    // has moved on to a different task must not write task A's response into
+    // task B's composer/transcript state.
+    const sentTaskId = task.id;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
-        setInput("");
-        setSendRefs([]);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+        }
         // The composer is now empty — clear the persisted draft so it can't
         // resurrect on next open. Cancel any pending autosave first, then
         // bump the write generation *before* firing the clear so an
@@ -2541,31 +2788,47 @@ function RunPanelBody({
         // review finding #4). Also drop pristine: the composer was just
         // consumed, so nothing should reseed it from a stale poll that still
         // shows the pre-clear draft (finding #2's adopt effects check this).
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
+        // These refs track THIS panel's currently-displayed task's draft, so
+        // they must only be touched when the panel hasn't moved on.
+        if (currentTaskIdRef.current === sentTaskId) {
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        // Task A's persisted draft is cleared regardless of whether the panel
+        // has since switched away — the message was sent, so A's stashed
+        // draft should go either way. `sentTaskId` (not the possibly-stale
+        // `task.id` closure) is what was actually sent to.
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
         // stays pinned on the pre-send transcript and the user's own
         // message never appears.
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
         // Pin the view to the newest content the moment the message is
         // accepted — the user's own message lands first, followed by
         // streamed assistant chunks. The unified task-level stream picks
         // up the new turn's events automatically; no run-switching needed.
         // Flip nearBottom so the streamed chunks that follow keep auto-
         // scrolling until the user manually scrolls up again.
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the paste was withheld and the server
         // already re-stashed this exact message into the task's backlog tray
@@ -2576,22 +2839,34 @@ function RunPanelBody({
         // instead of waiting for the next 2s task poll, and toast the
         // outcome — there's no run/turn here to carry a status line the way
         // a mid-turn withhold would.
-        setInput("");
-        setSendRefs([]);
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        // Not per-task display state — surface regardless of which task the
+        // panel is showing now, same as any other toast.
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      // Do not clear task B's `sending` flag from task A's `finally` — if the
+      // panel has moved on, the reset effect already cleared it for B (or B
+      // has its own send in flight that owns it).
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2610,28 +2885,34 @@ function RunPanelBody({
   const saveForLater = async () => {
     const text = input.trim();
     if (!text && !sendRefs.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
-      setBacklogItems(updated.backlog);
-      setInput("");
-      setSendRefs([]);
-      // Stashed into the backlog — clear the draft slot so it doesn't also
-      // resurrect in the composer on next open. Cancel any pending autosave
-      // first, then bump the write generation before firing the clear so an
-      // in-flight autosave PUT can't win the race and resurrect the
-      // just-stashed text (code review finding #4), and drop pristine so a
-      // stale poll can't reseed it either (finding #2).
-      cancelDraftSaveTimer();
-      draftGenRef.current++;
-      lastSavedDraftRef.current = null;
-      draftPristineRef.current = false;
-      void api.clearTaskDraft(task.id).catch(() => {});
+      const updated = await api.addBacklogItem(sentTaskId, { text, references: sendRefs });
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(updated.backlog);
+        setInput("");
+        setSendRefs([]);
+        // Stashed into the backlog — clear the draft slot so it doesn't also
+        // resurrect in the composer on next open. Cancel any pending autosave
+        // first, then bump the write generation before firing the clear so an
+        // in-flight autosave PUT can't win the race and resurrect the
+        // just-stashed text (code review finding #4), and drop pristine so a
+        // stale poll can't reseed it either (finding #2).
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+      }
+      void api.clearTaskDraft(sentTaskId).catch(() => {});
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2642,6 +2923,8 @@ function RunPanelBody({
   // item once the send is actually accepted.
   const sendBacklogItem = async (item: BacklogMessage) => {
     if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setSending(true);
     setBacklogBusy(true);
     setSendHint(null);
@@ -2650,22 +2933,32 @@ function RunPanelBody({
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
         try {
-          const updated = await api.deleteBacklogItem(task.id, item.id);
-          setBacklogItems(updated.backlog);
+          const updated = await api.deleteBacklogItem(sentTaskId, item.id);
+          if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
         } catch {
           // The send landed; if the consume call fails, drop it locally so the
           // user doesn't accidentally resend. The next task poll reconciles.
-          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          if (currentTaskIdRef.current === sentTaskId) {
+            setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          }
         }
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // No optimistic git-status touch here (main's #94 dropped that): the
         // git-status polling effect keeps `gitStatus` current on its own.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // `item` was never deleted above (delivery failed), so it's still
         // sitting in `backlogItems` — do NOT delete it here. The server's
@@ -2675,16 +2968,23 @@ function RunPanelBody({
         // already present and does NOT write a duplicate entry — no local
         // filtering needed here any more. Just refetch and adopt whatever the
         // server has.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSending(false);
+        setBacklogBusy(false);
+      }
     }
   };
 
@@ -2692,31 +2992,39 @@ function RunPanelBody({
     itemId: string,
     patch: { text?: string; references?: TaskReference[] },
   ) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.updateBacklogItem(task.id, itemId, patch);
-      setBacklogItems(updated.backlog);
+      const updated = await api.updateBacklogItem(sentTaskId, itemId, patch);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
   const removeBacklogItem = async (itemId: string) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     const prev = backlogItems;
     setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
     try {
-      const updated = await api.deleteBacklogItem(task.id, itemId);
-      setBacklogItems(updated.backlog);
+      const updated = await api.deleteBacklogItem(sentTaskId, itemId);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setBacklogItems(prev); // roll back
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(prev); // roll back
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2727,6 +3035,8 @@ function RunPanelBody({
     const idx = backlogItems.findIndex((m) => m.id === itemId);
     const to = idx + dir;
     if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     const next = [...backlogItems];
     const [moved] = next.splice(idx, 1);
     next.splice(to, 0, moved!);
@@ -2734,12 +3044,14 @@ function RunPanelBody({
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
-      setBacklogItems(updated.backlog);
+      const updated = await api.reorderBacklog(sentTaskId, next.map((m) => m.id));
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2752,6 +3064,8 @@ function RunPanelBody({
     // prefix and the push hint names the real branch. Shared with the CLI's
     // `agetor commit` / dashboard `c` so every surface sends the same text.
     const message = commitPushPrompt(task);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.
@@ -2760,28 +3074,41 @@ function RunPanelBody({
     try {
       const res = await api.sendRunInput(resumableRunId, message);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the canned commit/push message was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away and toast the outcome; there's no
         // run/turn here to carry a status line the way a mid-turn withhold
         // would.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2823,31 +3150,44 @@ function RunPanelBody({
       headRef: prStatus.headRef,
       baseRef: prStatus.baseRef,
     });
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setResolvingConflicts(true);
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, prompt);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
-        if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
-        setResolveConflictsSent(true);
-        resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+          if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+          setResolveConflictsSent(true);
+          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the merge/resolve-conflicts prompt was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away; toast (not toast.error — nothing
         // failed, the message just landed somewhere other than the agent)
         // since the button can be hidden by the time this resolves.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
       } else {
-        setSendHint(res.reason);
+        if (currentTaskIdRef.current === sentTaskId) setSendHint(res.reason);
         // The button can be hidden by the time this resolves — archived,
         // a subagent tab (dock-level), or the mergeability re-fetch clearing
         // `prStatus` — any of which would make `sendHint` invisible, so
@@ -2856,10 +3196,10 @@ function RunPanelBody({
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setSendHint(msg);
+      if (currentTaskIdRef.current === sentTaskId) setSendHint(msg);
       toast.error(msg);
     } finally {
-      setResolvingConflicts(false);
+      if (currentTaskIdRef.current === sentTaskId) setResolvingConflicts(false);
     }
   };
 
@@ -2932,7 +3272,13 @@ function RunPanelBody({
     setSendDragging(false);
     if (!canSend) return;
     setSendHint(null);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // `capture.handleResult` writes into this composer's `setInput`/
+    // `setSendRefs`/`setSendHint`, which belong to whichever task is
+    // currently displayed — not necessarily the one the drop happened on.
+    const sentTaskId = task.id;
     const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
+    if (currentTaskIdRef.current !== sentTaskId) return;
     capture.handleResult(result);
   };
 
@@ -3225,7 +3571,15 @@ function RunPanelBody({
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
-      <TerminalsSection task={task} />
+      {/* Keyed on task id: RunPanelBody itself isn't remounted on a task
+          switch (see the `[task.id]` reset effect above), so without this key
+          `TerminalsSection` — and the `TerminalView` it mounts — would keep
+          the previous task's open/closed state and sockets. Keying forces a
+          fresh mount per task, which both re-seeds the open/closed toggle
+          from the new task's `openTerminalCount` and, via `TerminalView`'s
+          own unmount, closes the previous task's terminal sockets instead of
+          leaking them across the switch. */}
+      <TerminalsSection key={task.id} task={task} awaitReady={awaitStreamReady} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -3306,9 +3660,17 @@ function RunPanelBody({
               </Button>
             </div>
           )}
-          {runs.length === 0 ? (
+          {!runsLoaded && displayedEvents.length === 0 ? (
+            // Gated on BOTH `runsLoaded` and `displayedEvents.length` — the SSE
+            // subscription is now issued before `listRuns` (see the stream-first
+            // task-switch work), so a replay can land its events before the
+            // slower `listRuns` response arrives. Showing the skeleton on
+            // `!runsLoaded` alone would hide those already-rendered events
+            // behind "Loading messages…" until `listRuns` finally resolves.
+            <div className="text-muted-foreground" data-testid="transcript-loading">Loading messages…</div>
+          ) : runsLoaded && runs.length === 0 ? (
             <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
-          ) : displayedEvents.length === 0 ? (
+          ) : runsLoaded && displayedEvents.length === 0 ? (
             <div className="text-muted-foreground">Waiting for the first event…</div>
           ) : (
             <>
@@ -3355,7 +3717,14 @@ function RunPanelBody({
                   // backlog tray instead of losing it. Refresh the tray right
                   // away and toast (not toast.error — nothing failed).
                   toast(reason);
-                  void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+                  // Captured before the async gap — see `currentTaskIdRef`'s
+                  // doc comment: this panel may have switched to a different
+                  // task by the time `getTask` resolves.
+                  const sentTaskId = task.id;
+                  void api.getTask(sentTaskId).then((fresh) => {
+                    if (currentTaskIdRef.current !== sentTaskId) return;
+                    setBacklogItems(fresh.backlog);
+                  }).catch(() => {});
                 }}
               />
             </>
@@ -3372,6 +3741,12 @@ function RunPanelBody({
           view-only (`readOnly`), so saved drafts aren't silently invisible. */}
       {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
+          // Keyed on task id so a switch between two tasks that both have
+          // backlog items remounts the tray instead of carrying over its
+          // internal `editingId` (RunPanelBody itself isn't remounted — see
+          // the `[task.id]` reset effect above, which resets everything IT
+          // owns but can't reach into a child's local state without this).
+          key={task.id}
           fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
@@ -4335,13 +4710,46 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task }: { task: Task }) {
+function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
-  // the count changes (e.g. closing one of two terminals). RunPanel remounts
-  // on task switch (keyed by id), so this re-seeds per task.
+  // the count changes (e.g. closing one of two terminals). `RunPanelBody`
+  // itself is NOT remounted on a task switch, but this section is keyed on
+  // `task.id` at its call site above, so it (and the `TerminalView` it
+  // mounts) gets a fresh instance per task — that's what re-seeds this open/
+  // closed state and closes the previous task's terminal sockets instead of
+  // carrying them over.
   const [open, setOpen] = useState(count > 0);
+  // Defer mounting `TerminalView` (and its `listTerminals` fetch) until the
+  // stream-first gate opens — same non-essential-fetch deferral as the
+  // git-status/PR-mergeability effects in `RunPanelBody` (see plan
+  // §3.4(c)): without this, a terminal list request competes with the SSE
+  // subscription for the webview's shared per-host connection budget in the
+  // task-switch burst. Seeded false and re-resolved on every mount because
+  // this component is keyed on `task.id` at its call site, so each task gets
+  // its own fresh `ready` gate.
+  const [ready, setReady] = useState(false);
+  // `awaitReady` (RunPanelBody's `awaitStreamReady`) is a plain function
+  // recreated every parent render, not a stable `useCallback` — captured in
+  // a ref (same pattern as `onCloseRef` above) so this effect doesn't tear
+  // down and re-run on every RunPanelBody re-render (e.g. the 2s kanban
+  // poll). This component is keyed on `task.id` at its call site, so it
+  // mounts fresh — and re-awaits — once per task regardless.
+  const awaitReadyRef = useRef(awaitReady);
+  awaitReadyRef.current = awaitReady;
+  useEffect(() => {
+    let cancelled = false;
+    // Pass this section's own task id: the gate is task-keyed because this
+    // mount effect runs BEFORE RunPanelBody's reset effect on a task switch,
+    // so a bare "is the stream ready" boolean would still be the previous
+    // task's answer here.
+    const forTaskId = task.id;
+    void awaitReadyRef.current(forTaskId).then(() => {
+      if (!cancelled) setReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [task.id]);
   return (
     <details
       className="border-b border-border/60"
@@ -4354,7 +4762,7 @@ function TerminalsSection({ task }: { task: Task }) {
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        <TerminalView taskId={task.id} />
+        {ready && <TerminalView taskId={task.id} />}
       </div>
     </details>
   );

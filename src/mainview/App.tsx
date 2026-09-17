@@ -326,6 +326,13 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
+  // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
+  // a tick is skipped while the previous poll of the same kind hasn't
+  // resolved yet, so a slow request never stacks with the next tick's.
+  const refreshPollInFlightRef = useRef(false);
+  const refreshAgentsPollInFlightRef = useRef(false);
+  const refreshProjectsPollInFlightRef = useRef(false);
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
@@ -472,16 +479,43 @@ function AppInner() {
     // bug previously fixed there.
     const t = setInterval(() => {
       if (!document.hidden) {
-        void refresh();
-        void refreshProjects();
+        // Skip this tick if the previous `refresh()` poll is still in
+        // flight — see `refreshPollInFlightRef`'s comment above.
+        if (!refreshPollInFlightRef.current) {
+          refreshPollInFlightRef.current = true;
+          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+        }
+        // Same guard, its own ref — a slow `/projects` fetch must not stack
+        // with the next 2s tick either.
+        if (!refreshProjectsPollInFlightRef.current) {
+          refreshProjectsPollInFlightRef.current = true;
+          void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+        }
       }
     }, 2000);
-    const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
+    const a = setInterval(() => {
+      if (!document.hidden && !refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
+    }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
-      void refresh();
-      void refreshProjects();
-      void refreshAgents();
+      // Route through the same in-flight guard the interval poll uses — a
+      // focus/visibility event landing mid-poll must not stack a second
+      // `/tasks` request on top of one already in flight.
+      if (!refreshPollInFlightRef.current) {
+        refreshPollInFlightRef.current = true;
+        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+      }
+      if (!refreshProjectsPollInFlightRef.current) {
+        refreshProjectsPollInFlightRef.current = true;
+        void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+      }
+      if (!refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
       // fx login (and any other harness auth flow) often happens in a
       // separate window/terminal — returning focus to agetor should reflect
       // whatever the account's catalog looks like now, not whatever it was
