@@ -68,6 +68,10 @@ import m050 from "./050_sent_files.sql" with { type: "text" };
 import m051 from "./051_fx_recovery.sql" with { type: "text" };
 import m052 from "./052_agent_profiles.sql" with { type: "text" };
 import m053 from "./053_task_agent_profile.sql" with { type: "text" };
+// Authored as 040_account_usage on the multi-account-discovery branch
+// (pre-upstream-sync numbering); renumbered to 054 on port, original id kept
+// as an alias (same renumber-with-alias pattern used throughout this file).
+import m054 from "./054_account_usage.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -129,4 +133,5 @@ export const migrations: Migration[] = [
   { id: "051_fx_recovery", sql: m051 },
   { id: "052_agent_profiles", sql: m052 },
   { id: "053_task_agent_profile", sql: m053 },
+  { id: "054_account_usage", sql: m054, aliases: ["040_account_usage"] },
 ];

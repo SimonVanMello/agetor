@@ -16,7 +16,7 @@ import { Select } from "@/components/ui/select";
 import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
 import { Switch } from "@/components/ui/switch";
-import { cn } from "@/lib/utils";
+import { cn, formatTokens } from "@/lib/utils";
 import {
   AGENT_OPTIONS,
   CATALOG_SCOPED_KINDS,
@@ -762,8 +762,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         size="sm"
                         variant={agent === h.id ? "default" : "outline"}
                         onClick={() => switchAgent(h.id)}
+                        // Account email + today's token burn come first: with
+                        // two claude harnesses, "which account is this and
+                        // does it have headroom" is the decision being made.
                         title={
                           [
+                            status?.account?.email,
+                            status?.usage &&
+                              `today ${formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok`,
                             status?.reason,
                             status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
                             status?.path,

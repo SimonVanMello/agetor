@@ -141,6 +141,8 @@ function makeStatus(harnessId: string, overrides: Partial<HarnessStatus> = {}): 
     version: "0.0.6",
     reason: null,
     installHint: null,
+    account: null,
+    usage: null,
     loggedIn: true,
     authHelp: null,
     ...overrides,
