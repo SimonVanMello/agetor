@@ -3578,8 +3578,22 @@ function RunPanelBody({
           fresh mount per task, which both re-seeds the open/closed toggle
           from the new task's `openTerminalCount` and, via `TerminalView`'s
           own unmount, closes the previous task's terminal sockets instead of
-          leaking them across the switch. */}
-      <TerminalsSection key={task.id} task={task} awaitReady={awaitStreamReady} />
+          leaking them across the switch.
+
+          The key is NAMESPACED (`terminals-…`), never a bare `task.id`:
+          `BacklogTray` below is a sibling in this same children list and is
+          keyed per task too. Sibling keys share one namespace, and React's
+          keyed reconciliation keeps a single old fiber per key — with two
+          `key={task.id}` siblings the tray's fiber shadowed this one, so
+          every re-render on the reconciler's map-based slow path while the
+          tray was mounted — in practice all of them, since the normally
+          `false` `{searchOpen && …}` child above breaks the fast path —
+          mounted a NEW section and never deleted the old one (a growing
+          stack of TERMINAL rows, each holding a live `TerminalView`). The
+          rule for this fragment: every keyed child carries its component's
+          name in the key (`PlanDialog` below is the third one). See
+          docs/plans/terminal-section-duplication.md. */}
+      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -3747,7 +3761,10 @@ function RunPanelBody({
           // internal `editingId` (RunPanelBody itself isn't remounted — see
           // the `[task.id]` reset effect above, which resets everything IT
           // owns but can't reach into a child's local state without this).
-          key={task.id}
+          // Namespaced, not a bare `task.id`: `TerminalsSection` above is a
+          // keyed sibling in this same children list, and two siblings with
+          // one key make React leak the earlier one on every re-render.
+          key={`backlog-${task.id}`}
           fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
@@ -4077,10 +4094,13 @@ function RunPanelBody({
       {/* Keyed by plan id (stable across in-place status/edit updates as
           `plans` refreshes from the poll or a mutation's returned Task) so
           the dialog's internal text/mode state resets on genuine plan
-          switches but survives its own plan being updated in place. */}
+          switches but survives its own plan being updated in place.
+          Namespaced (`plan-…`) like the other two keyed children of this
+          fragment (`TerminalsSection`, `BacklogTray`): no two children here
+          may ever share a key — see the comment on `TerminalsSection`. */}
       {openPlan && (
         <PlanDialog
-          key={openPlan.id}
+          key={`plan-${openPlan.id}`}
           task={task}
           plan={openPlan}
           agentKind={kind}
@@ -4753,6 +4773,7 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTa
   }, [task.id]);
   return (
     <details
+      data-testid="terminals-section"
       className="border-b border-border/60"
       open={open}
       onToggle={(e) => setOpen(e.currentTarget.open)}
