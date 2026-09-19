@@ -98,7 +98,7 @@ import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
+import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
@@ -1778,7 +1778,9 @@ function RunPanelBody({
   // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
   // straight — it derives each event's search id from its own position in
   // the array, so there's no separate pre-mapped/id-tagged array to build
-  // or memoize here.
+  // or memoize here. (It matches a `user` event against its NORMALIZED text —
+  // lead-in stripped, `<pasted_content>` unwrapped — i.e. what the bubble
+  // actually shows; see `searchableEventText`.)
   const matches = useMemo(
     () => findMatchingEventIds(displayedEvents, searchQuery),
     [displayedEvents, searchQuery],
@@ -5549,6 +5551,27 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
+  // Normalize once, up front, and feed every branch below from this single
+  // string instead of the raw wire `text`: CR→LF (tmux's paste-buffer
+  // artifact — see event-dedup.ts) then `normalizeDeliveredUserText`
+  // (shared/user-message.ts) — which strips agetor's own typed lead-in line
+  // and unwraps claude CLI's `<pasted_content id="…">…</pasted_content
+  // id="…">` wrapper around a bracketed-paste follow-up (see
+  // docs/plans/pasted-content-tags.md D1/D2). Without this, a pasted send's
+  // lead-in + wrapper tags would show up verbatim in the ordinary-message
+  // fallback branch (`ordinary` below), which — unlike `parsed` — used to
+  // read straight off `text`. `parseUserMessage` re-runs the same
+  // normalization internally (a no-op here since it's already applied — see
+  // `normalizeDeliveredUserText`'s identity-on-no-match contract), so
+  // handing it already-normalized text changes nothing about its own
+  // behavior; it just means every downstream consumer (segments, path
+  // folding, "Show more" measuring, copy/quote of the bubble) sees the same
+  // clean string.
+  const normalizedText = useMemo(
+    () => normalizeDeliveredUserText(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
   // Recognize slash-command invocations (XML expansion or plain echo),
   // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
   // "tagged" kind) any other message carrying balanced top-level tags — a
@@ -5556,20 +5579,18 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // so all of these render as structured UI instead of literal `<tag>` text.
   // `null` for an ordinary message — the fallback branch below renders
   // exactly what this component always has.
-  const parsed = useMemo(() => parseUserMessage(text), [text]);
+  const parsed = useMemo(() => parseUserMessage(normalizedText), [normalizedText]);
 
   // For an ordinary (non-command) message, split off a trailing "Referenced
   // files/folders:" block the same way the command branch already does, so
   // an image-attached (or file/folder-attached) send renders its paths as
-  // chips instead of a literal bullet list in the markdown body. Newlines
-  // are normalized first — `splitReferences`' blank-line paragraph split
-  // needs real `\n`s, and the JSONL twin of a send can carry bare `\r`s (see
-  // event-dedup.ts). When there's no trailing refs block, `splitReferences`
-  // returns `args` unchanged and an empty `references` array, so this is a
-  // no-op split for the common case.
+  // chips instead of a literal bullet list in the markdown body. When
+  // there's no trailing refs block, `splitReferences` returns `args`
+  // unchanged and an empty `references` array, so this is a no-op split for
+  // the common case.
   const ordinary = useMemo(
-    () => splitReferences(text.replace(/\r\n?/g, "\n")),
-    [text],
+    () => splitReferences(normalizedText),
+    [normalizedText],
   );
 
   // Strip `[Image #N]` placeholders only when the message actually carries
