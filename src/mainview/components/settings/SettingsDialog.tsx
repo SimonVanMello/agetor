@@ -20,6 +20,7 @@ import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
+import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import {
   SETTINGS_SECTIONS,
   activeSection,
@@ -1301,11 +1302,7 @@ function Editor({
       };
     }
     const uniqId = uniqueHarnessId(template.suggestedHarnessId, existingIds);
-    let home = template.home;
-    const orig = template.suggestedHarnessId;
-    if (home && orig && uniqId !== orig && home.endsWith(`/${orig}`)) {
-      home = `${home.slice(0, -orig.length)}${uniqId}`;
-    }
+    const home = resolveTemplateInitialHome(template, uniqId);
     return { id: uniqId, home: home ? abbreviateHome(home, homeDir) : "" };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
