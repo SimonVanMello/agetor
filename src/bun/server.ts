@@ -29,6 +29,8 @@ import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { accountUsageDays } from "./account-usage.ts";
+import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
@@ -3156,6 +3158,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
+      // logged-in account that no registered harness points at yet — the
+      // Add-harness picker renders these as one-click "use existing account"
+      // entries. Identity fields only; never tokens or account uuids.
+      "/harness-discovery": {
+        GET: authed((req) => {
+          const registeredHomes = harnesses.list()
+            .filter((h) => h.kind === "claude-code")
+            .map((h) => h.home);
+          return json(
+            { accounts: discoverClaudeAccounts(registeredHomes) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
       "/harnesses/:id": {
         GET: authed((req) => {
           const h = harnesses.get(req.params.id);
@@ -3521,6 +3539,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Daily per-model token rollups for the harness's ACCOUNT (config dir),
+      // for the Settings drill-down. Distinct from `/harnesses/:id/usage`
+      // above, which reports task counts — do not overload that route.
+      // claude-code only: other kinds have no local usage source wired yet.
+      "/harnesses/:id/account-usage": {
+        GET: authed((req) => {
+          const h = harnesses.getByIdOrKind(req.params.id);
+          if (!h) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (h.kind !== "claude-code") {
+            return json(
+              { error: "account usage is only available for claude-code harnesses" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const configDir = effectiveClaudeConfigDir(h.home);
+          return json(
+            { configDir, days: accountUsageDays(configDir) },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 

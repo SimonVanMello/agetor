@@ -422,6 +422,58 @@ export interface HarnessUsage {
   totalTaskCount: number;
 }
 
+/**
+ * The identity block of a logged-in Claude account, read from the account's
+ * `.claude.json` (`oauthAccount`). Deliberately excludes `accountUuid` and
+ * anything token-shaped — this crosses the API boundary to the webview and
+ * must stay safe to display.
+ */
+export interface ClaudeAccount {
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+}
+
+/**
+ * An existing Claude config dir found on disk that no registered harness
+ * points at yet — surfaced in the Add-harness picker so a second account
+ * (`~/.claude-adevinta` style) is one click instead of a hand-typed path.
+ */
+export interface DiscoveredAccount {
+  /** Absolute path to the config dir (would become `Harness.home`). */
+  configDir: string;
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+  /** Slug derived from the dir name; the UI may bump it on collision. */
+  suggestedHarnessId: string;
+}
+
+/** Aggregated token counts for one time window of one account. */
+export interface TokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+
+/**
+ * Per-account LOCAL token-usage rollup attached to a claude-code harness's
+ * status — fed by an incremental scan of the account's own
+ * `<configDir>/projects/**\/*.jsonl` transcripts (src/bun/account-usage.ts),
+ * so it survives claude's own transcript retention deleting the raw files.
+ * Keyed by config dir, not harness id — two harnesses sharing a `home` share
+ * one account, and the numbers include the user's direct CLI sessions too
+ * (the budget shown is the account's, not agetor's). This is a historical,
+ * purely-local, no-network token count — not a live quota/limit meter.
+ */
+export interface AccountUsageSummary {
+  configDir: string;
+  today: TokenTotals;
+  last7d: TokenTotals;
+}
+
 export interface HarnessStatus {
   /** The harness this status is for. */
   harnessId: string;
@@ -436,6 +488,12 @@ export interface HarnessStatus {
   reason: string | null;
   /** Suggested install command when missing. */
   installHint: string | null;
+  /** Logged-in account identity (claude-code only; null for other kinds,
+   *  for a logged-out account, or an unreadable config blob). */
+  account: ClaudeAccount | null;
+  /** Local historical token-usage rollup for the harness's account
+   *  (claude-code only; null for other kinds). See {@link AccountUsageSummary}. */
+  usage: AccountUsageSummary | null;
   /**
    * Login state, when the kind's probe can determine it cheaply and without
    * side effects — today only fx (`fx status --json` reports `auth`). Strictly
