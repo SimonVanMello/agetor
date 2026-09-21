@@ -31,6 +31,7 @@ import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./tas
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -730,6 +731,68 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           projects.delete(p);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Checkout an existing GitHub repo as a new project: clone it, register
+      // the destination in the projects list, and (unless eli5:false) create +
+      // start a claude-code task that writes an ELI5.md explainer at the clone's
+      // root. The explainer goes through agetor's own agent driver — never a
+      // direct LLM API call — so it shows up on the board like any other task.
+      "/projects/clone": {
+        POST: authed(async (req) => {
+          // Clones are network-bound and can take minutes; disable the
+          // per-request idle timeout like /tasks/:id/start does.
+          server.timeout(req, 0);
+          const body = (await req.json().catch(() => ({}))) as {
+            url?: unknown;
+            dest?: unknown;
+            eli5?: unknown;
+          };
+          const url = typeof body.url === "string" ? body.url.trim() : "";
+          if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          const parsed = parseGitHubRepo(url);
+          if (!parsed) {
+            return json(
+              { error: `not a GitHub repo — use https://github.com/owner/repo, git@github.com:owner/repo.git, or owner/repo` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const dest =
+            typeof body.dest === "string" && body.dest.trim()
+              ? body.dest.trim()
+              : defaultCloneDest(parsed.repo);
+          if (!path.isAbsolute(dest)) {
+            return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const cloned = await cloneRepo(parsed.cloneUrl, dest);
+          if (!cloned.ok) {
+            return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
+          }
+          const project = projects.upsert(dest, parsed.repo);
+
+          // The explainer task runs with isolation "none" so ELI5.md lands
+          // directly in the clone the user just registered, not on a branch in
+          // a worktree. Task-creation failure downgrades the response, never
+          // rolls back the clone — the project is already usable.
+          let eli5TaskId: string | null = null;
+          let eli5Error: string | null = null;
+          if (body.eli5 !== false) {
+            const created = await createTask({
+              title: eli5TaskTitle(parsed.repo),
+              prompt: buildEli5Prompt(parsed.repo),
+              workdir: dest,
+              isolation: "none",
+            });
+            if ("error" in created) {
+              eli5Error = created.error;
+            } else {
+              eli5TaskId = created.task.id;
+              const started = await startTask(created.task.id);
+              if ("error" in started) eli5Error = started.error;
+            }
+          }
+          return json({ project, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
         }),
       },
 

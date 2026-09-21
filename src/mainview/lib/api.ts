@@ -552,6 +552,11 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  cloneProject: (url: string, dest?: string, eli5?: boolean) =>
+    j<{ project: Project; eli5TaskId: string | null; eli5Error: string | null }>(
+      "/projects/clone",
+      { method: "POST", body: JSON.stringify({ url, dest, eli5 }) },
+    ),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
    *  project has no stored config, so the form always gets a usable shape. */
   getProjectBranchConfig: (p: string) =>
