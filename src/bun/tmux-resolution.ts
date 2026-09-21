@@ -66,6 +66,29 @@ export function resolveTmuxBin(): string {
   return Bun.which("tmux", { PATH: process.env.PATH }) ?? "tmux";
 }
 
+/**
+ * PATH to forward into an agent's tmux session. When `bin` is an absolute path,
+ * its directory is moved to the front of PATH.
+ *
+ * Agent CLIs installed through a node version manager (codex, gemini, …) are
+ * `#!/usr/bin/env node` scripts whose matching `node` sits in that same
+ * directory. A daemon launched from the Dock/Finder inherits a minimal PATH
+ * that lacks it, so the session died at startup with
+ * `env: node: No such file or directory`. Putting the binary's own directory
+ * first also makes `env node` pick the interpreter the CLI was installed with
+ * rather than an older one further down PATH. A bare command name (`"codex"`)
+ * carries no directory, so PATH is returned unchanged.
+ */
+export function agentSessionPath(
+  bin: string | undefined,
+  basePath: string | undefined = process.env.PATH,
+): string | undefined {
+  if (!bin || !path.isAbsolute(bin)) return basePath;
+  const dir = path.dirname(bin);
+  const rest = (basePath ?? "").split(":").filter((p) => p && p !== dir);
+  return [dir, ...rest].join(":");
+}
+
 /** True when the bundled binary is actually present on disk. */
 export function bundledTmuxAvailable(): boolean {
   return existsSync(bundledTmuxPath());

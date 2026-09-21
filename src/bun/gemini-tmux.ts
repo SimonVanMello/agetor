@@ -13,7 +13,7 @@ import {
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession, agentSessionPath } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
@@ -456,7 +456,8 @@ export async function spawnGeminiViaTmux(opts: GeminiLaunchOptions): Promise<Spa
   const envArgs: string[] = [];
   // Forward PATH so gemini's own shell-tool invocations resolve dev binaries,
   // plus the harness env (GEMINI_CLI_HOME) that controls gemini's login/history.
-  if (process.env.PATH) { envArgs.push("-e", `PATH=${process.env.PATH}`); }
+  const sessionPath = agentSessionPath(opts.argv[0]);
+  if (sessionPath) { envArgs.push("-e", `PATH=${sessionPath}`); }
   for (const [k, v] of Object.entries(opts.env)) envArgs.push("-e", `${k}=${v}`);
 
   const args = [

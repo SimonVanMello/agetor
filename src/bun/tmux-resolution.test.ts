@@ -16,6 +16,7 @@ process.env.AGETOR_DATA_DIR = testDataDir;
 let deriveTmuxSocketName: (dataDirPath: string) => string;
 let tmuxSocketName: () => string | null;
 let tmuxSocketArgs: () => string[];
+let agentSessionPath: (bin: string | undefined, basePath?: string) => string | undefined;
 let buildEnsureServerArgv: (tmuxBin: string) => string[];
 let ensureDisclaimedServer: () => Promise<void>;
 let DISCLAIM_PREF_KEY: string;
@@ -29,6 +30,7 @@ beforeAll(async () => {
     tmuxSocketArgs,
     buildEnsureServerArgv,
     ensureDisclaimedServer,
+    agentSessionPath,
   } = await import("./tmux-resolution.ts"));
   ({ DISCLAIM_PREF_KEY } = await import("./disclaim.ts"));
   ({ preferences, dataDir } = await import("./db.ts"));
@@ -156,4 +158,23 @@ test("tmuxSocketArgs: mirrors tmuxSocketName() as -L flags, or [] for the defaul
   expect(tmuxSocketArgs()).toEqual(["-L", "foo"]);
   process.env.AGETOR_TMUX_SOCKET = "default";
   expect(tmuxSocketArgs()).toEqual([]);
+});
+
+test("agentSessionPath: puts an absolute binary's directory first so `env node` finds its sibling node", () => {
+  expect(agentSessionPath("/home/u/.nvm/versions/node/v22/bin/codex", "/usr/bin:/bin"))
+    .toBe("/home/u/.nvm/versions/node/v22/bin:/usr/bin:/bin");
+});
+
+test("agentSessionPath: moves the directory to the front instead of duplicating it", () => {
+  expect(agentSessionPath("/opt/x/bin/codex", "/usr/bin:/opt/x/bin:/bin"))
+    .toBe("/opt/x/bin:/usr/bin:/bin");
+});
+
+test("agentSessionPath: leaves PATH untouched for a bare command name or no binary", () => {
+  expect(agentSessionPath("codex", "/usr/bin:/bin")).toBe("/usr/bin:/bin");
+  expect(agentSessionPath(undefined, "/usr/bin:/bin")).toBe("/usr/bin:/bin");
+});
+
+test("agentSessionPath: works when PATH is empty", () => {
+  expect(agentSessionPath("/opt/x/bin/codex", "")).toBe("/opt/x/bin");
 });
